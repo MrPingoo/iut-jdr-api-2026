@@ -20,8 +20,8 @@ services:
     App\:
         resource: '../src/'
 
-    # Configuration spécifique pour GameMasterController
-    App\Controller\GameMasterController:
+    # Configuration spécifique pour OpenAiService
+    App\Service\OpenAiService:
         arguments:
             $openaiApiKey: '%openai.api_key%'
 

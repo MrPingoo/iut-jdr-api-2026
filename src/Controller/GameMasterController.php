@@ -2,27 +2,44 @@
 
 namespace App\Controller;
 
+use App\Service\NpcGeneratorService;
+use App\Service\OpenAiService;
+use App\Service\PromptBuilderService;
 use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\Routing\Annotation\Route;
-use Symfony\Contracts\HttpClient\HttpClientInterface;
 
+/**
+ * Game Master Controller
+ *
+ * This controller handles all game master interactions for the D&D-style RPG game.
+ * It manages game sessions, player actions, dice rolls, and NPC interactions
+ * by communicating with the OpenAI API to generate dynamic narrative content.
+ */
 #[Route('/api/game')]
 class GameMasterController extends AbstractController
 {
-    private const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
-
     public function __construct(
-        private HttpClientInterface $httpClient,
-        private string $openaiApiKey
+        private OpenAiService $openAiService,
+        private NpcGeneratorService $npcGenerator,
+        private PromptBuilderService $promptBuilder
     ) {}
 
     /**
-     * Initialise une nouvelle session de jeu avec le contexte du personnage
+     * Initialize a new game session with character context and NPCs
      *
-     * POST /api/game/start
-     * Body: {
+     * This endpoint starts a new game session by:
+     * 1. Generating companion NPCs based on party size
+     * 2. Creating the initial game narrative
+     * 3. Introducing the companions to the player
+     *
+     * @route POST /api/game/start
+     * @param Request $request JSON body with character data, player count, and setting
+     * @return JsonResponse Session data with introduction, NPCs, and session ID
+     *
+     * Request body example:
+     * {
      *   "character": {
      *     "name": "Grimjaw",
      *     "race": "Orc",
@@ -44,38 +61,37 @@ class GameMasterController extends AbstractController
     #[Route('/start', name: 'game_start', methods: ['POST'])]
     public function startGame(Request $request): JsonResponse
     {
+        // Parse request data
         $data = json_decode($request->getContent(), true);
-
         $character = $data['character'] ?? null;
         $players = $data['players'] ?? 4;
         $setting = $data['setting'] ?? "Terres Désolées d'Azeroth";
 
+        // Validate required data
         if (!$character) {
             return $this->json(['error' => 'Character data is required'], 400);
         }
 
         try {
-            // Générer les PNJs compagnons
-            $npcs = $this->generateNPCs($character, $players - 1); // -1 car le personnage principal compte
+            // Generate NPC companions (subtract 1 because player character counts)
+            $npcs = $this->npcGenerator->generateNPCs($character, $players - 1);
 
-            // Créer le prompt initial pour ChatGPT avec les PNJs
-            $systemPrompt = $this->buildSystemPrompt($character, $players, $setting, $npcs);
+            // Build the system prompt with character and NPC context
+            $systemPrompt = $this->promptBuilder->buildSystemPrompt($character, $players, $setting, $npcs);
 
-            $response = $this->callOpenAI([
-                [
-                    'role' => 'system',
-                    'content' => $systemPrompt
-                ],
-                [
-                    'role' => 'user',
-                    'content' => sprintf(
-                        'Commence l\'aventure. Présente brièvement les %d compagnons (%s) et décris la scène d\'ouverture.',
-                        count($npcs),
-                        implode(', ', array_column($npcs, 'name'))
-                    )
-                ]
-            ], 600); // Plus de tokens pour l'introduction
+            // Build the initial user prompt
+            $userPrompt = $this->promptBuilder->buildGameStartPrompt($npcs);
 
+            // Create message array for OpenAI
+            $messages = [
+                $this->openAiService->createMessage('system', $systemPrompt),
+                $this->openAiService->createMessage('user', $userPrompt)
+            ];
+
+            // Get AI-generated introduction (600 tokens for longer introduction)
+            $response = $this->openAiService->chat($messages, 600);
+
+            // Return success response with game session data
             return $this->json([
                 'success' => true,
                 'sessionId' => uniqid('game_'),
@@ -83,18 +99,28 @@ class GameMasterController extends AbstractController
                 'npcs' => $npcs,
                 'timestamp' => time()
             ]);
+
         } catch (\Exception $e) {
             return $this->json([
-                'error' => 'Erreur lors de la communication avec ChatGPT: ' . $e->getMessage()
+                'error' => 'Error communicating with ChatGPT: ' . $e->getMessage()
             ], 500);
         }
     }
 
     /**
-     * Envoie une action du joueur et récupère la réponse du maître du jeu
+     * Process a player action and get the game master's response
      *
-     * POST /api/game/action
-     * Body: {
+     * This endpoint handles player actions during the game by:
+     * 1. Building the conversation context from history
+     * 2. Submitting the action to the AI game master
+     * 3. Returning the narrative consequences
+     *
+     * @route POST /api/game/action
+     * @param Request $request JSON body with character, action, context, and history
+     * @return JsonResponse Game master's response to the action
+     *
+     * Request body example:
+     * {
      *   "character": { ... },
      *   "action": "Je m'avance prudemment dans le donjon",
      *   "context": {
@@ -111,60 +137,66 @@ class GameMasterController extends AbstractController
     #[Route('/action', name: 'game_action', methods: ['POST'])]
     public function playerAction(Request $request): JsonResponse
     {
+        // Parse request data
         $data = json_decode($request->getContent(), true);
-
         $character = $data['character'] ?? null;
         $action = $data['action'] ?? null;
         $context = $data['context'] ?? [];
         $history = $data['history'] ?? [];
 
+        // Validate required fields
         if (!$character || !$action) {
             return $this->json(['error' => 'Character and action are required'], 400);
         }
 
         try {
-            // Construire les messages pour ChatGPT avec l'historique
-            $messages = [
-                [
-                    'role' => 'system',
-                    'content' => $this->buildSystemPrompt($character, 4, $context['location'] ?? 'Donjon')
-                ]
-            ];
+            // Build system prompt with current game context
+            $systemPrompt = $this->promptBuilder->buildSystemPrompt(
+                $character,
+                4,
+                $context['location'] ?? 'Donjon'
+            );
 
-            // Ajouter l'historique des messages
-            foreach ($history as $msg) {
-                $messages[] = $msg;
-            }
+            // Build user prompt for the action
+            $userPrompt = $this->promptBuilder->buildPlayerActionPrompt($character, $action);
 
-            // Ajouter l'action actuelle
-            $messages[] = [
-                'role' => 'user',
-                'content' => sprintf(
-                    "%s fait l'action suivante : %s\n\nRéponds en tant que Maître du Jeu et décris les conséquences. Si nécessaire, demande un jet de dé.",
-                    $character['name'],
-                    $action
-                )
-            ];
+            // Build complete message history including system prompt, history, and new action
+            $messages = $this->openAiService->buildMessageHistory(
+                $this->openAiService->createMessage('system', $systemPrompt),
+                $history,
+                $this->openAiService->createMessage('user', $userPrompt)
+            );
 
-            $response = $this->callOpenAI($messages);
+            // Get AI response
+            $response = $this->openAiService->chat($messages);
 
             return $this->json([
                 'success' => true,
                 'response' => $response,
                 'timestamp' => time()
             ]);
+
         } catch (\Exception $e) {
             return $this->json([
-                'error' => 'Erreur lors de la communication avec ChatGPT: ' . $e->getMessage()
+                'error' => 'Error communicating with ChatGPT: ' . $e->getMessage()
             ], 500);
         }
     }
 
     /**
-     * Résout un jet de dé et obtient la réponse du maître du jeu
+     * Process a dice roll result and get the game master's interpretation
      *
-     * POST /api/game/dice-result
-     * Body: {
+     * This endpoint resolves dice rolls by:
+     * 1. Receiving the dice roll outcome
+     * 2. Sending it to the AI game master for interpretation
+     * 3. Returning the narrative outcome based on the roll
+     *
+     * @route POST /api/game/dice-result
+     * @param Request $request JSON body with character, dice roll data, context, and history
+     * @return JsonResponse Game master's response to the dice roll
+     *
+     * Request body example:
+     * {
      *   "character": { ... },
      *   "diceRoll": {
      *     "type": "d20",
@@ -180,62 +212,62 @@ class GameMasterController extends AbstractController
     #[Route('/dice-result', name: 'game_dice_result', methods: ['POST'])]
     public function diceResult(Request $request): JsonResponse
     {
+        // Parse request data
         $data = json_decode($request->getContent(), true);
-
         $character = $data['character'] ?? null;
         $diceRoll = $data['diceRoll'] ?? null;
         $context = $data['context'] ?? '';
         $history = $data['history'] ?? [];
 
+        // Validate required fields
         if (!$character || !$diceRoll) {
             return $this->json(['error' => 'Character and dice roll are required'], 400);
         }
 
         try {
-            $messages = [
-                [
-                    'role' => 'system',
-                    'content' => $this->buildSystemPrompt($character, 4, 'Donjon')
-                ]
-            ];
+            // Build system prompt
+            $systemPrompt = $this->promptBuilder->buildSystemPrompt($character, 4, 'Donjon');
 
-            foreach ($history as $msg) {
-                $messages[] = $msg;
-            }
+            // Build dice result prompt
+            $userPrompt = $this->promptBuilder->buildDiceResultPrompt($character, $diceRoll, $context);
 
-            $messages[] = [
-                'role' => 'user',
-                'content' => sprintf(
-                    "%s a lancé %s pour %s.\nRésultat du dé: %d + %d = %d\nContexte: %s\n\nEn tant que Maître du Jeu, décris le résultat de cette action selon le jet de dé.",
-                    $character['name'],
-                    $diceRoll['type'] ?? 'd20',
-                    $diceRoll['skillCheck'] ?? 'une action',
-                    $diceRoll['result'] ?? 0,
-                    $diceRoll['modifier'] ?? 0,
-                    $diceRoll['total'] ?? 0,
-                    $context
-                )
-            ];
+            // Build complete message history
+            $messages = $this->openAiService->buildMessageHistory(
+                $this->openAiService->createMessage('system', $systemPrompt),
+                $history,
+                $this->openAiService->createMessage('user', $userPrompt)
+            );
 
-            $response = $this->callOpenAI($messages);
+            // Get AI interpretation of the dice roll
+            $response = $this->openAiService->chat($messages);
 
             return $this->json([
                 'success' => true,
                 'response' => $response,
                 'timestamp' => time()
             ]);
+
         } catch (\Exception $e) {
             return $this->json([
-                'error' => 'Erreur lors de la communication avec ChatGPT: ' . $e->getMessage()
+                'error' => 'Error communicating with ChatGPT: ' . $e->getMessage()
             ], 500);
         }
     }
 
     /**
-     * Génère une réponse d'un autre joueur NPC
+     * Generate an NPC's response to a game situation
      *
-     * POST /api/game/npc-action
-     * Body: {
+     * This endpoint allows NPCs to react to situations by:
+     * 1. Using the NPC's personality and character traits
+     * 2. Generating contextually appropriate dialogue
+     * 3. Keeping responses short and in-character
+     *
+     * @route POST /api/game/npc-action
+     * @param Request $request JSON body with NPC data, situation, and history
+     * @return JsonResponse The NPC's response to the situation
+     *
+     * Request body example:
+     * {
      *   "npc": {
      *     "name": "Elara la Sage",
      *     "race": "Elfe",
@@ -248,42 +280,33 @@ class GameMasterController extends AbstractController
     #[Route('/npc-action', name: 'game_npc_action', methods: ['POST'])]
     public function npcAction(Request $request): JsonResponse
     {
+        // Parse request data
         $data = json_decode($request->getContent(), true);
-
         $npc = $data['npc'] ?? null;
         $situation = $data['situation'] ?? '';
         $history = $data['history'] ?? [];
 
+        // Validate required fields
         if (!$npc) {
             return $this->json(['error' => 'NPC data is required'], 400);
         }
 
         try {
-            $messages = [
-                [
-                    'role' => 'system',
-                    'content' => sprintf(
-                        "Tu es %s, un personnage %s de classe %s dans un jeu de rôle. Tu dois réagir de manière cohérente avec ton personnage. Réponds en une ou deux phrases courtes comme si tu parlais en tant que ce personnage.",
-                        $npc['name'],
-                        $npc['race'] ?? 'inconnu',
-                        $npc['class'] ?? 'aventurier'
-                    )
-                ]
-            ];
+            // Build NPC-specific system prompt
+            $systemPrompt = $this->promptBuilder->buildNpcSystemPrompt($npc);
 
-            foreach ($history as $msg) {
-                $messages[] = $msg;
-            }
+            // Build action prompt for the situation
+            $userPrompt = $this->promptBuilder->buildNpcActionPrompt($situation);
 
-            $messages[] = [
-                'role' => 'user',
-                'content' => sprintf(
-                    "Situation actuelle: %s\n\nComment réagis-tu ou que fais-tu ?",
-                    $situation
-                )
-            ];
+            // Build message history
+            $messages = $this->openAiService->buildMessageHistory(
+                $this->openAiService->createMessage('system', $systemPrompt),
+                $history,
+                $this->openAiService->createMessage('user', $userPrompt)
+            );
 
-            $response = $this->callOpenAI($messages, 150); // Limite de tokens plus courte pour les NPCs
+            // Get AI response (shorter token limit for NPCs)
+            $response = $this->openAiService->chat($messages, 150);
 
             return $this->json([
                 'success' => true,
@@ -291,235 +314,11 @@ class GameMasterController extends AbstractController
                 'npcName' => $npc['name'],
                 'timestamp' => time()
             ]);
+
         } catch (\Exception $e) {
             return $this->json([
-                'error' => 'Erreur lors de la communication avec ChatGPT: ' . $e->getMessage()
+                'error' => 'Error communicating with ChatGPT: ' . $e->getMessage()
             ], 500);
         }
-    }
-
-    /**
-     * Génère des PNJs compagnons pour la partie
-     */
-    private function generateNPCs(array $character, int $count): array
-    {
-        if ($count <= 0) {
-            return [];
-        }
-
-        $races = ['Elfe', 'Nain', 'Humain', 'Halfelin', 'Demi-Elfe', 'Tiefling'];
-        $classes = ['Guerrier', 'Magicien', 'Roublard', 'Clerc', 'Rôdeur', 'Paladin', 'Barde', 'Druide'];
-
-        $namesByRace = [
-            'Elfe' => ['Elara', 'Thranduil', 'Galadriel', 'Legolas', 'Arwen'],
-            'Nain' => ['Thorin', 'Gimli', 'Balin', 'Dwalin', 'Dori'],
-            'Humain' => ['Aragorn', 'Boromir', 'Éowyn', 'Faramir', 'Théoden'],
-            'Halfelin' => ['Bilbo', 'Frodo', 'Sam', 'Merry', 'Pippin'],
-            'Demi-Elfe' => ['Elrond', 'Elladan', 'Elrohir', 'Estel'],
-            'Tiefling' => ['Zariel', 'Moloch', 'Levistus', 'Glasya']
-        ];
-
-        $npcs = [];
-        $usedCombinations = [];
-
-        for ($i = 0; $i < $count; $i++) {
-            // Éviter les doublons de race/classe
-            do {
-                $race = $races[array_rand($races)];
-                $class = $classes[array_rand($classes)];
-                $combination = "$race-$class";
-            } while (in_array($combination, $usedCombinations));
-
-            $usedCombinations[] = $combination;
-
-            // Choisir un nom approprié
-            $names = $namesByRace[$race] ?? ['Compagnon'];
-            $baseName = $names[array_rand($names)];
-            $name = $baseName;
-
-            // Ajouter un suffixe si le nom existe déjà
-            $counter = 1;
-            while (in_array($name, array_column($npcs, 'name'))) {
-                $name = $baseName . ' ' . ['le Brave', 'le Sage', 'l\'Ancien', 'le Jeune', 'le Rapide'][$counter % 5];
-                $counter++;
-            }
-
-            $npcs[] = [
-                'name' => $name,
-                'race' => $race,
-                'class' => $class,
-                'personality' => $this->generatePersonality($class),
-                'level' => $character['level'] ?? 1
-            ];
-        }
-
-        return $npcs;
-    }
-
-    /**
-     * Génère une personnalité pour un PNJ selon sa classe
-     */
-    private function generatePersonality(string $class): string
-    {
-        $personalities = [
-            'Guerrier' => ['brave', 'loyal', 'protecteur', 'direct'],
-            'Magicien' => ['intellectuel', 'curieux', 'prudent', 'mystérieux'],
-            'Roublard' => ['rusé', 'agile', 'cynique', 'opportuniste'],
-            'Clerc' => ['pieux', 'compatissant', 'sage', 'dévoué'],
-            'Rôdeur' => ['indépendant', 'silencieux', 'observateur', 'proche de la nature'],
-            'Paladin' => ['honorable', 'juste', 'déterminé', 'charismatique'],
-            'Barde' => ['charmant', 'créatif', 'sociable', 'optimiste'],
-            'Druide' => ['sage', 'pacifique', 'mystique', 'en harmonie avec la nature']
-        ];
-
-        $traits = $personalities[$class] ?? ['équilibré'];
-        return $traits[array_rand($traits)];
-    }
-
-    /**
-     * Construit le prompt système pour ChatGPT
-     */
-    private function buildSystemPrompt(array $character, int $players, string $setting, array $npcs = []): string
-    {
-        $stats = $character['stats'] ?? [];
-
-        $npcsList = '';
-        if (!empty($npcs)) {
-            $npcsList = "\n\nLes compagnons PNJs du groupe :\n";
-            foreach ($npcs as $npc) {
-                $npcsList .= sprintf(
-                    "- %s : %s %s (niveau %d, personnalité : %s)\n",
-                    $npc['name'],
-                    $npc['race'],
-                    $npc['class'],
-                    $npc['level'],
-                    $npc['personality']
-                );
-            }
-            $npcsList .= "\nTu dois incarner ces PNJs et les faire réagir de manière cohérente avec leur personnalité.";
-        }
-
-        return sprintf(
-            "Tu es un Maître du Jeu expert dans Donjons & Dragons 5e. Tu guides une aventure épique dans le monde de %s.
-
-Le personnage principal joué par l'utilisateur :
-- Nom: %s
-- Race: %s
-- Classe: %s
-- Niveau: %d
-- Caractéristiques:
-  * Force: %d
-  * Constitution: %d
-  * Intelligence: %d
-  * Sagesse: %d
-  * Dextérité: %d
-  * Charisme: %d
-%s
-Il y a %d joueurs dans la partie (incluant le personnage principal).
-
-RÈGLES IMPORTANTES:
-1. Structure tes réponses de manière claire avec des paragraphes courts (2-3 phrases max)
-2. Utilise des sauts de ligne pour séparer les différentes informations
-3. Mets en évidence les éléments importants (jets de dés, dangers, choix)
-4. Utilise les règles de D&D 5e pour les jets de dés et difficultés
-5. Demande des jets de dés quand approprié en les mettant sur une ligne séparée
-6. Fais réagir l'environnement et les PNJs de manière dynamique
-7. Crée des situations intéressantes et des choix moraux
-8. Adapte la difficulté au niveau du personnage
-9. Reste cohérent avec l'univers fantasy et les capacités du personnage
-10. Réponds en français, dans un style narratif épique mais concis
-11. Fais intervenir les PNJs compagnons de manière naturelle et selon leur personnalité
-12. **OBLIGATOIRE** : Termine TOUJOURS ta réponse par une question ou un choix pour le joueur
-
-FORMAT DE RÉPONSE OBLIGATOIRE :
-- Commence par une description courte de la scène (1-2 phrases)
-- Si des PNJs réagissent, mets leurs dialogues entre guillemets sur des lignes séparées
-- Si un jet de dé est nécessaire, indique-le clairement : \"⚔️ Jet requis : [Compétence] (DD [Difficulté])\"
-- **TERMINE TOUJOURS** par une question directe au joueur (Que faites-vous ? / Comment réagissez-vous ? / Quelle est votre décision ?)
-- Utilise des émojis occasionnellement pour plus de clarté (⚔️ combat, 🔍 investigation, 💬 dialogue, ⚠️ danger, ❓ choix)
-
-Exemples de bonnes réponses :
-
-Exemple 1 (Exploration) :
-\"Vous poussez les lourdes portes qui grincent dans l'obscurité. L'air est humide et une odeur de moisissure vous assaille.
-
-Elara murmure une incantation et une lueur bleutée éclaire le couloir. \"Je détecte de la magie résiduelle...\"
-
-Au sol, vous remarquez des traces fraîches menant vers les profondeurs.
-
-❓ Que faites-vous ?\"
-
-Exemple 2 (Combat imminent) :
-\"Des grognements résonnent depuis les ombres. Trois silhouettes se rapprochent lentement.
-
-Thorin serre le pommeau de son épée. \"Préparez-vous au combat...\"
-
-⚔️ Jet requis : Initiative (1d20 + modificateur de Dextérité)
-
-❓ Comment vous positionnez-vous pour le combat ?\"
-
-Exemple 3 (Choix moral) :
-\"Le garde blessé vous supplie de l'épargner. \"J'ai une famille... Je vous en prie...\"
-
-Bilbo chuchote : \"On pourrait le laisser partir... Ou l'interroger d'abord.\"
-
-💬 Que décidez-vous ?\"
-
-Exemple 4 (Investigation) :
-\"La salle est jonchée de grimoires poussiéreux. Au centre, un piédestal soutient une gemme rougeoyante.
-
-Elara s'approche prudemment. \"Cette magie est puissante... Et dangereuse.\"
-
-🔍 Jet requis : Arcanes (DD 15) pour identifier la gemme
-
-❓ Voulez-vous tenter d'identifier la gemme ou l'ignorer ?\"
-
-RAPPEL CRITIQUE : Ne termine JAMAIS une réponse sans poser une question au joueur. Même après un jet de dé réussi, demande toujours \"Que faites-vous ensuite ?\" ou une variante.
-
-Commence chaque réponse en restant en immersion totale dans le rôle du Maître du Jeu.",
-            $setting,
-            $character['name'] ?? 'Aventurier',
-            $character['race'] ?? 'Humain',
-            $character['class'] ?? 'Guerrier',
-            $character['level'] ?? 1,
-            $stats['strength'] ?? 10,
-            $stats['constitution'] ?? 10,
-            $stats['intelligence'] ?? 10,
-            $stats['wisdom'] ?? 10,
-            $stats['dexterity'] ?? 10,
-            $stats['charisma'] ?? 10,
-            $npcsList,
-            $players
-        );
-    }
-
-    /**
-     * Effectue un appel à l'API OpenAI
-     */
-    private function callOpenAI(array $messages, int $maxTokens = 500): string
-    {
-        $response = $this->httpClient->request('POST', self::OPENAI_API_URL, [
-            'headers' => [
-                'Authorization' => 'Bearer ' . $this->openaiApiKey,
-                'Content-Type' => 'application/json',
-            ],
-            'json' => [
-                'model' => 'gpt-3.5-turbo',
-                'messages' => $messages,
-                'max_tokens' => $maxTokens,
-                'temperature' => 0.8, // Créativité modérée
-                'top_p' => 1,
-                'frequency_penalty' => 0.3, // Évite les répétitions
-                'presence_penalty' => 0.3, // Encourage la diversité
-            ],
-        ]);
-
-        $data = $response->toArray();
-
-        if (!isset($data['choices'][0]['message']['content'])) {
-            throw new \Exception('Réponse invalide de l\'API OpenAI');
-        }
-
-        return trim($data['choices'][0]['message']['content']);
     }
 }
