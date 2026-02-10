@@ -90,6 +90,32 @@ RÈGLES IMPORTANTES:
 - Les compagnons peuvent aussi subir/infliger des dégâts selon la situation
 - Si un personnage atteint 0 PV, indique qu'il est inconscient ou gravement blessé
 
+**GESTION DE L'EXPÉRIENCE (XP) ET DES NIVEAUX :**
+- Les personnages gagnent de l'XP en accomplissant des exploits (combats, quêtes, découvertes, etc.)
+- Tu DOIS accorder de l'XP après chaque action réussie, victoire ou accomplissement significatif
+- Format OBLIGATOIRE pour les gains d'XP :
+  [XP_GAIN] {\"character\": \"NomDuPersonnage\", \"xp\": 50, \"reason\": \"Victoire contre un gobelin\"}
+
+  Exemples de gains d'XP :
+  [XP_GAIN] {\"character\": \"%s\", \"xp\": 100, \"reason\": \"Victoire contre un dragon\"}
+  [XP_GAIN] {\"character\": \"Elara\", \"xp\": 50, \"reason\": \"Résolution d'énigme\"}
+  [XP_GAIN] {\"character\": \"%s\", \"xp\": 25, \"reason\": \"Exploration de donjon\"}
+  [XP_GAIN] {\"character\": \"Thorin\", \"xp\": 75, \"reason\": \"Sauvetage d'un villageois\"}
+
+- Barème des gains d'XP :
+  * Action mineure (exploration, interaction) : 10-25 XP
+  * Combat facile (gobelins, loups) : 30-50 XP
+  * Combat moyen (orcs, trolls) : 50-100 XP
+  * Combat difficile (dragon, démon) : 100-200 XP
+  * Résolution de quête : 50-150 XP
+  * Découverte importante : 25-75 XP
+  * Acte héroïque : 100-300 XP
+
+- Accorde de l'XP à TOUS les personnages impliqués dans l'action (joueur + compagnons actifs)
+- Le joueur passe automatiquement de niveau quand il atteint l'XP requise
+- Lors d'un passage de niveau, les PV sont restaurés au maximum
+- Sois généreux avec l'XP pour encourager la progression
+
 FORMAT DE RÉPONSE OBLIGATOIRE :
 - Commence par une description courte de la scène (1-2 phrases)
 - Si des PNJs réagissent, mets leurs dialogues entre guillemets sur des lignes séparées
@@ -150,11 +176,13 @@ Commence chaque réponse en restant en immersion totale dans le rôle du Maître
             $stats['charisma'] ?? 10,
             $npcsList,
             $playerCount,
-            $characterName,
-            $maxHp,
-            $level,
-            $characterName,
-            $characterName
+            $characterName,  // PV section
+            $maxHp,          // PV section
+            $level,          // PV section
+            $characterName,  // HP_CHANGE exemple 1
+            $characterName,  // HP_CHANGE exemple 2
+            $characterName,  // XP_GAIN exemple 1
+            $characterName   // XP_GAIN exemple 2
         );
     }
 
