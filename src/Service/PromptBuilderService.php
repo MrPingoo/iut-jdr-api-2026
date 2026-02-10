@@ -30,6 +30,11 @@ class PromptBuilderService
     ): string {
         $stats = $character['stats'] ?? [];
         $npcsList = $this->buildNpcsDescription($npcs);
+        $characterName = $character['name'] ?? 'Aventurier';
+
+        // Calculer les PV max basés sur le niveau (15 PV au niveau 1, 35 PV au niveau 20)
+        $level = $character['level'] ?? 1;
+        $maxHp = $this->calculateMaxHp($level);
 
         return sprintf(
             "Tu es un Maître du Jeu expert dans Donjons & Dragons 5e. Tu guides une aventure épique dans le monde de %s.
@@ -39,6 +44,7 @@ Le personnage principal joué par l'utilisateur :
 - Race: %s
 - Classe: %s
 - Niveau: %d
+- PV Maximum: %d
 - Caractéristiques:
   * Force: %d
   * Constitution: %d
@@ -62,6 +68,27 @@ RÈGLES IMPORTANTES:
 10. Réponds en français, dans un style narratif épique mais concis
 11. Fais intervenir les PNJs compagnons de manière naturelle et selon leur personnalité
 12. **OBLIGATOIRE** : Termine TOUJOURS ta réponse par une question ou un choix pour le joueur
+
+**GESTION DES POINTS DE VIE (PV) :**
+- Le personnage %s possède %d PV maximum (niveau %d)
+- Les compagnons ont aussi des PV basés sur leur niveau
+- Lors de combats ou situations dangereuses, tu DOIS indiquer les changements de PV
+- Format OBLIGATOIRE pour les changements de PV : utilise une ligne spéciale avec le format JSON suivant :
+  [HP_CHANGE] {\"character\": \"NomDuPersonnage\", \"change\": -5, \"reason\": \"Coup d'épée gobeline\"}
+
+  Exemples de changements de PV :
+  [HP_CHANGE] {\"character\": \"%s\", \"change\": -8, \"reason\": \"Attaque de dragon\"}
+  [HP_CHANGE] {\"character\": \"Elara\", \"change\": -3, \"reason\": \"Flèche empoisonnée\"}
+  [HP_CHANGE] {\"character\": \"%s\", \"change\": 10, \"reason\": \"Potion de soin\"}
+  [HP_CHANGE] {\"character\": \"Thorin\", \"change\": 15, \"reason\": \"Repos long\"}
+
+- Les changements négatifs représentent des dégâts (-1 à -20 selon la gravité)
+- Les changements positifs représentent des soins (+1 à +20)
+- Sois logique : une égratignure = -1 à -3 PV, une attaque sérieuse = -5 à -10 PV, une attaque critique = -15 à -20 PV
+- Lors d'un combat réussi (bon jet de dé), le joueur peut infliger des dégâts à l'ennemi SANS perdre de PV
+- Lors d'un combat échoué (mauvais jet), le joueur subit des dégâts
+- Les compagnons peuvent aussi subir/infliger des dégâts selon la situation
+- Si un personnage atteint 0 PV, indique qu'il est inconscient ou gravement blessé
 
 FORMAT DE RÉPONSE OBLIGATOIRE :
 - Commence par une description courte de la scène (1-2 phrases)
@@ -110,10 +137,11 @@ RAPPEL CRITIQUE : Ne termine JAMAIS une réponse sans poser une question au joue
 
 Commence chaque réponse en restant en immersion totale dans le rôle du Maître du Jeu.",
             $setting,
-            $character['name'] ?? 'Aventurier',
+            $characterName,
             $character['race'] ?? 'Humain',
             $character['class'] ?? 'Guerrier',
-            $character['level'] ?? 1,
+            $level,
+            $maxHp,
             $stats['strength'] ?? 10,
             $stats['constitution'] ?? 10,
             $stats['intelligence'] ?? 10,
@@ -121,7 +149,12 @@ Commence chaque réponse en restant en immersion totale dans le rôle du Maître
             $stats['dexterity'] ?? 10,
             $stats['charisma'] ?? 10,
             $npcsList,
-            $playerCount
+            $playerCount,
+            $characterName,
+            $maxHp,
+            $level,
+            $characterName,
+            $characterName
         );
     }
 
@@ -175,14 +208,32 @@ Commence chaque réponse en restant en immersion totale dans le rôle du Maître
      *
      * @param array $character Player character data
      * @param string $action The action the player wants to take
+     * @param array $context Game context including HP
      * @return string Formatted user prompt
      */
-    public function buildPlayerActionPrompt(array $character, string $action): string
+    public function buildPlayerActionPrompt(array $character, string $action, array $context = []): string
     {
+        $hpInfo = '';
+
+        // Ajouter les informations de PV si disponibles
+        if (isset($context['characterHp'])) {
+            $maxHp = $context['characterMaxHp'] ?? 35;
+            $hpInfo .= sprintf("\nPV actuels de %s : %d/%d", $character['name'], $context['characterHp'], $maxHp);
+        }
+
+        if (isset($context['companionsHp']) && !empty($context['companionsHp'])) {
+            $hpInfo .= "\nPV des compagnons :";
+            foreach ($context['companionsHp'] as $companion) {
+                $maxHp = $companion['maxHp'] ?? 35;
+                $hpInfo .= sprintf("\n- %s : %d/%d", $companion['name'], $companion['hp'], $maxHp);
+            }
+        }
+
         return sprintf(
-            "%s fait l'action suivante : %s\n\nRéponds en tant que Maître du Jeu et décris les conséquences. Si nécessaire, demande un jet de dé.",
+            "%s fait l'action suivante : %s%s\n\nRéponds en tant que Maître du Jeu et décris les conséquences. Si nécessaire, demande un jet de dé. Si l'action implique un combat ou un danger, indique les changements de PV avec le format [HP_CHANGE].",
             $character['name'],
-            $action
+            $action,
+            $hpInfo
         );
     }
 
@@ -192,19 +243,37 @@ Commence chaque réponse en restant en immersion totale dans le rôle du Maître
      * @param array $character Player character data
      * @param array $diceRoll Dice roll details (type, result, modifier, total, skillCheck)
      * @param string $context Context of the dice roll
+     * @param array $gameContext Game context including HP
      * @return string Formatted user prompt
      */
-    public function buildDiceResultPrompt(array $character, array $diceRoll, string $context): string
+    public function buildDiceResultPrompt(array $character, array $diceRoll, string $context, array $gameContext = []): string
     {
+        $hpInfo = '';
+
+        // Ajouter les informations de PV si disponibles
+        if (isset($gameContext['characterHp'])) {
+            $maxHp = $gameContext['characterMaxHp'] ?? 35;
+            $hpInfo .= sprintf("\nPV actuels de %s : %d/%d", $character['name'], $gameContext['characterHp'], $maxHp);
+        }
+
+        if (isset($gameContext['companionsHp']) && !empty($gameContext['companionsHp'])) {
+            $hpInfo .= "\nPV des compagnons :";
+            foreach ($gameContext['companionsHp'] as $companion) {
+                $maxHp = $companion['maxHp'] ?? 35;
+                $hpInfo .= sprintf("\n- %s : %d/%d", $companion['name'], $companion['hp'], $maxHp);
+            }
+        }
+
         return sprintf(
-            "%s a lancé %s pour %s.\nRésultat du dé: %d + %d = %d\nContexte: %s\n\nEn tant que Maître du Jeu, décris le résultat de cette action selon le jet de dé.",
+            "%s a lancé %s pour %s.\nRésultat du dé: %d + %d = %d\nContexte: %s%s\n\nEn tant que Maître du Jeu, décris le résultat de cette action selon le jet de dé. Si l'action réussie/échoue implique des dégâts ou des soins, indique les changements de PV avec le format [HP_CHANGE].",
             $character['name'],
             $diceRoll['type'] ?? 'd20',
             $diceRoll['skillCheck'] ?? 'une action',
             $diceRoll['result'] ?? 0,
             $diceRoll['modifier'] ?? 0,
             $diceRoll['total'] ?? 0,
-            $context
+            $context,
+            $hpInfo
         );
     }
 
@@ -237,4 +306,28 @@ Commence chaque réponse en restant en immersion totale dans le rôle du Maître
             $situation
         );
     }
+
+    /**
+     * Calculate maximum HP based on character level
+     * Level 1: 15 HP
+     * Level 20: 35 HP
+     * Linear progression between levels
+     *
+     * @param int $level Character level (1-20)
+     * @return int Maximum HP
+     */
+    private function calculateMaxHp(int $level): int
+    {
+        // Assurer que le niveau est entre 1 et 20
+        $level = max(1, min(20, $level));
+
+        // Formule linéaire : HP = 15 + ((level - 1) * 20 / 19)
+        // Niveau 1: 15 + 0 = 15 PV
+        // Niveau 20: 15 + (19 * 20 / 19) = 15 + 20 = 35 PV
+        $baseHp = 15;
+        $hpPerLevel = 20 / 19; // Progression de 20 PV sur 19 niveaux
+
+        return (int) round($baseHp + (($level - 1) * $hpPerLevel));
+    }
 }
+

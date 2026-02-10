@@ -157,8 +157,8 @@ class GameMasterController extends AbstractController
                 $context['location'] ?? 'Donjon'
             );
 
-            // Build user prompt for the action
-            $userPrompt = $this->promptBuilder->buildPlayerActionPrompt($character, $action);
+            // Build user prompt for the action with HP context
+            $userPrompt = $this->promptBuilder->buildPlayerActionPrompt($character, $action, $context);
 
             // Build complete message history including system prompt, history, and new action
             $messages = $this->openAiService->buildMessageHistory(
@@ -217,6 +217,7 @@ class GameMasterController extends AbstractController
         $character = $data['character'] ?? null;
         $diceRoll = $data['diceRoll'] ?? null;
         $context = $data['context'] ?? '';
+        $gameContext = $data['gameContext'] ?? [];
         $history = $data['history'] ?? [];
 
         // Validate required fields
@@ -228,8 +229,8 @@ class GameMasterController extends AbstractController
             // Build system prompt
             $systemPrompt = $this->promptBuilder->buildSystemPrompt($character, 4, 'Donjon');
 
-            // Build dice result prompt
-            $userPrompt = $this->promptBuilder->buildDiceResultPrompt($character, $diceRoll, $context);
+            // Build dice result prompt with HP context
+            $userPrompt = $this->promptBuilder->buildDiceResultPrompt($character, $diceRoll, $context, $gameContext);
 
             // Build complete message history
             $messages = $this->openAiService->buildMessageHistory(
